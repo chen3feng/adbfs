@@ -78,6 +78,19 @@ Mount your device (You will be asked and have to allow fuse extension):
 
 Have fun!
 
+### `._` / `.DS_Store` files on the device
+
+macOS writes AppleDouble (`._name`) and `.DS_Store` sidecar files onto any
+volume that lacks native extended-attribute support. adbfs implements the
+extended-attribute operations, so with **macFUSE** (the default build) these
+files are avoided automatically -- no special mount option is needed.
+
+**fuse-t** is NFS-backed and bypasses those operations, so it still scatters
+`._` files on the device. If you use fuse-t, either switch to macFUSE or clean
+up afterwards:
+
+    adb shell 'find /sdcard -name "._*" -delete; find /sdcard -name .DS_Store -delete'
+
 ## Troubleshooting
 
 ### Error: device not found
