@@ -1,4 +1,6 @@
 adbfs
+adbfs-macfuse
+adbfs-fuset
 adbfs.o
 .cproject
 .project

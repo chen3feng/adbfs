@@ -17,10 +17,24 @@ adbfs.o: adbfs.cpp utils.h
 $(TARGET): adbfs.o
 	$(CXX) -o $(TARGET) adbfs.o $(LDFLAGS)
 
+# macOS convenience: build both FUSE backends side by side as adbfs-macfuse
+# and adbfs-fuset. Each is a separate sub-build because the FUSE library is
+# selected at compile/link time.
+.PHONY: both
+both:
+	rm -f adbfs.o $(TARGET)
+	$(MAKE) FUSE_PKG=fuse
+	mv -f $(TARGET) $(TARGET)-macfuse
+	rm -f adbfs.o $(TARGET)
+	$(MAKE) FUSE_PKG=fuse-t
+	mv -f $(TARGET) $(TARGET)-fuset
+	rm -f adbfs.o
+	@echo "Built $(TARGET)-macfuse (macFUSE) and $(TARGET)-fuset (fuse-t)"
+
 .PHONY: clean
 
 clean:
-	rm -rf *.o html/ latex/ $(TARGET)
+	rm -rf *.o html/ latex/ $(TARGET) $(TARGET)-macfuse $(TARGET)-fuset
 
 doc: Doxyfile
 	doxygen $<

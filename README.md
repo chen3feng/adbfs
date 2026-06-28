@@ -55,6 +55,10 @@ If using fuse-t, build with:
 
     make FUSE_PKG=fuse-t
 
+To build both backends side by side (as `adbfs-macfuse` and `adbfs-fuset`):
+
+    make both
+
 Check access to phone through adb
 
     adb devices
