@@ -1161,6 +1161,87 @@ static int adb_readlink(const char *path, char *buf, size_t size)
     return 0;
 }
 
+// Backport of spion/adbfs-rootless#16, with the path properly single-quoted
+// (the original left it unquoted, breaking on paths with spaces). Returning
+// success from chmod also stops `cp -p`/copyfile failing with "fchmod failed:
+// Function not implemented".
+static int adb_chmod(const char *path, mode_t mode) {
+    char mode_c[8];
+    snprintf(mode_c, sizeof(mode_c), "%o", mode & 07777);
+
+    string path_string(path);
+    shell_escape_path(path_string);
+
+    string command = "chmod ";
+    command.append(mode_c);
+    command.append(" '");
+    command.append(path_string);
+    command.append("'");
+    adb_shell(command);
+    invalidateCache(path_string);
+    return 0;
+}
+
+static int adb_chown(const char *path, uid_t uid, gid_t gid) {
+    char owner_c[24];
+    snprintf(owner_c, sizeof(owner_c), "%u:%u", uid, gid);
+
+    string path_string(path);
+    shell_escape_path(path_string);
+
+    string command = "chown ";
+    command.append(owner_c);
+    command.append(" '");
+    command.append(path_string);
+    command.append("'");
+    adb_shell(command);
+    invalidateCache(path_string);
+    return 0;
+}
+
+// Extended-attribute ops that accept and discard. adbfs cannot persist xattrs
+// on the device, but *implementing* these makes the volume advertise native
+// xattr support, so macOS stores its metadata via setxattr (which we silently
+// drop) instead of scattering AppleDouble "._" sidecars over the phone -- and
+// `cp`/`cp -p` no longer fail trying to copy extended attributes.
+#ifdef __APPLE__
+#include <sys/xattr.h>
+#endif
+#ifndef ENOATTR
+#define ENOATTR ENODATA
+#endif
+#if defined(__APPLE__)
+static int adb_setxattr(const char *path, const char *name, const char *value,
+                        size_t size, int flags, uint32_t position) {
+    (void)path; (void)name; (void)value; (void)size; (void)flags; (void)position;
+    return 0;
+}
+static int adb_getxattr(const char *path, const char *name, char *value,
+                        size_t size, uint32_t position) {
+    (void)path; (void)name; (void)value; (void)size; (void)position;
+    return -ENOATTR;
+}
+#else
+static int adb_setxattr(const char *path, const char *name, const char *value,
+                        size_t size, int flags) {
+    (void)path; (void)name; (void)value; (void)size; (void)flags;
+    return 0;
+}
+static int adb_getxattr(const char *path, const char *name, char *value,
+                        size_t size) {
+    (void)path; (void)name; (void)value; (void)size;
+    return -ENOATTR;
+}
+#endif
+static int adb_listxattr(const char *path, char *list, size_t size) {
+    (void)path; (void)list; (void)size;
+    return 0;
+}
+static int adb_removexattr(const char *path, const char *name) {
+    (void)path; (void)name;
+    return 0;
+}
+
 /**
    Main struct for FUSE interface.
  */
@@ -1194,6 +1275,12 @@ int main(int argc, char *argv[])
     adbfs_oper.rmdir = adb_rmdir;
     adbfs_oper.unlink = adb_unlink;
     adbfs_oper.readlink = adb_readlink;
+    adbfs_oper.chmod = adb_chmod;
+    adbfs_oper.chown = adb_chown;
+    adbfs_oper.setxattr = adb_setxattr;
+    adbfs_oper.getxattr = adb_getxattr;
+    adbfs_oper.listxattr = adb_listxattr;
+    adbfs_oper.removexattr = adb_removexattr;
     adb_shell("ls");
 
     struct fuse_args args = FUSE_ARGS_INIT(argc, argv);
