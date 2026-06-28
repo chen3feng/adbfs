@@ -687,6 +687,41 @@ static int adb_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 }
 
 
+// Create and open a new file. fuse-t (and macFUSE) route file creation
+// through this op and, unlike Linux libfuse, do not fall back to mknod+open
+// when it is missing -- so without it, creating files fails with EACCES.
+// We create an empty local copy, hand back its fd, and mark it pending so
+// adb_flush pushes it to the device on close.
+static int adb_create(const char *path, mode_t mode, struct fuse_file_info *fi)
+{
+    string path_string;
+    string local_path_string;
+    path_string.assign(path);
+    local_path_string = tempDirPath;
+    string_replacer(path_string,"/","-");
+    local_path_string.append(path_string);
+    path_string.assign(path);
+
+    cout << "-- adb_create --" << path << " " << local_path_string << "\n";
+
+    // Create the local working copy and keep it open for the upcoming writes.
+    int fd = open(local_path_string.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0644);
+    if (fd == -1)
+        return -errno;
+    fi->fh = fd;
+    filePendingWrite[fd] = true;
+
+    // Push the (empty) file to the device immediately so it exists right away:
+    // fuse-t issues a getattr straight after create, and that is served from
+    // the device. The real contents get pushed again by adb_flush on close.
+    shell_escape_path(path_string);
+    shell_escape_path(local_path_string);
+    adb_push(local_path_string, path_string);
+    adb_shell("sync");
+    invalidateParentDirCache(path_string);
+    return 0;
+}
+
 static int adb_open(const char *path, struct fuse_file_info *fi)
 {
     string path_string;
@@ -1145,6 +1180,7 @@ int main(int argc, char *argv[])
     adbfs_oper.readdir= adb_readdir;
     adbfs_oper.getattr= adb_getattr;
     adbfs_oper.access= adb_access;
+    adbfs_oper.create= adb_create;
     adbfs_oper.open= adb_open;
     adbfs_oper.flush = adb_flush;
     adbfs_oper.release = adb_release;
