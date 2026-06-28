@@ -121,6 +121,30 @@ void invalidateCache(const string& path) {
         fileData.erase(it);
 }
 
+// Cache of whole directory listings, keyed by the (escaped) directory path.
+// The kernel paginates large directories by calling readdir repeatedly with
+// growing offsets; without this cache each call would re-run `ls` on the
+// device, turning one listing into an O(n^2) storm of adb invocations.
+struct dirCache {
+    time_t timestamp;
+    vector<string> lines;
+};
+map<string,dirCache> dirData;
+
+void invalidateDirCache(const string& path) {
+    map<string, dirCache>::iterator it = dirData.find(path);
+    if (it != dirData.end())
+        dirData.erase(it);
+}
+
+// Invalidate the listing of the directory containing the given (escaped) path,
+// e.g. after a file is created, removed or renamed.
+void invalidateParentDirCache(const string& path) {
+    size_t pos = path.rfind('/');
+    string parent = (pos == string::npos || pos == 0) ? "/" : path.substr(0, pos);
+    invalidateDirCache(parent);
+}
+
 map<int,bool> filePendingWrite;
 map<string,bool> fileTruncated;
 bool touch_gnu_mode = true;
@@ -311,6 +335,7 @@ queue<string> adb_push(const string& local_source,
     adb_push_pull_cmd(cmd, true, local_source, remote_destination);
     queue<string> res = exec_command(cmd);
     invalidateCache(remote_destination);
+    invalidateParentDirCache(remote_destination);
     return res;
 }
 
@@ -587,68 +612,76 @@ size_t find_nth(int n, const string& substr, const string& corpus) {
 static int adb_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
     off_t offset, struct fuse_file_info *fi)
 {
-    (void) offset;
     (void) fi;
     string path_string;
-    string local_path_string;
     path_string.assign(path);
-    local_path_string = tempDirPath;
-    string_replacer(path_string,"/","-");
-    local_path_string.append(path_string);
-    path_string.assign(path);
-
     shell_escape_path(path_string);
 
-    queue<string> output;
-    string command = "ls -l -a '";
-    command.append(path_string);
-    command.append("'");
-    output = adb_shell(command);
+    // Fetch the directory listing once and cache it. The kernel paginates a
+    // large directory by calling readdir repeatedly with growing offsets
+    // (especially the NFS-backed fuse-t on macOS); serving those calls from
+    // the cache avoids re-running `ls` on the device every time.
+    map<string, dirCache>::iterator dit = dirData.find(path_string);
+    if (dit == dirData.end() || dit->second.timestamp + 30 < time(NULL)) {
+        string command = "ls -l -a '";
+        command.append(path_string);
+        command.append("'");
+        queue<string> output = adb_shell(command);
+        dirCache& entry = dirData[path_string];
+        entry.lines.clear();
+        while (!output.empty()) {
+            entry.lines.push_back(output.front());
+            output.pop();
+        }
+        entry.timestamp = time(NULL);
+        dit = dirData.find(path_string);
+        cout << "found files: " << entry.lines.size() << endl;
+    } else {
+        cout << "found files (cached): " << dit->second.lines.size() << endl;
+    }
+    const vector<string>& lines = dit->second.lines;
 
     /* cannot tell between "no phone" and "empty directory" */
-    cout << "found files: " << output.size() << endl;
-    while (output.size() > 0) {
+    for (size_t i = offset; i < lines.size(); ++i) {
+        const string& line = lines[i];
         // skip lines too short to process (should not happen)
-        if (output.front().length() >= 3) {
-            // we can get e.g. "permission denied" during listing, need to check every line separately
-            if (!is_valid_ls_output(output.front())) {
-                // error format: "lstat '//efs' failed: Permission denied"
-                if (
-                     output.front().length() > sizeof(PERMISSION_ERR_MSG) &&
-                     (!output.front().compare(output.front().length() - sizeof(PERMISSION_ERR_MSG) + 1,
-                                            sizeof(PERMISSION_ERR_MSG) - 1, PERMISSION_ERR_MSG))) {
-                    size_t nameStart = output.front().rfind("/") + 1;
-                    const string& fname_l = output.front().substr(nameStart, output.front().find("' ") - nameStart);
-                    cout << "Adding file:" << fname_l << ":" << endl;
-                    filler(buf, fname_l.c_str(), NULL, 0);
-                    const string& path_string_c = path_string
-                        + (path_string == "/" ? "" : "/") + fname_l;
+        if (line.length() < 3)
+            continue;
 
-                    cout << "caching " << path_string_c << " = " << output.front() <<  endl;
-                    fileData[path_string_c].statOutput.erase();
-                    fileData[path_string_c].timestamp = time(NULL);
-                    cout << "cached " << endl;
-                }
+        string fname;
+        // we can get e.g. "permission denied" during listing, need to check every line separately
+        bool valid = is_valid_ls_output(line);
+        if (!valid) {
+            // error format: "lstat '//efs' failed: Permission denied"
+            if (line.length() > sizeof(PERMISSION_ERR_MSG) &&
+                (!line.compare(line.length() - sizeof(PERMISSION_ERR_MSG) + 1,
+                               sizeof(PERMISSION_ERR_MSG) - 1, PERMISSION_ERR_MSG))) {
+                size_t nameStart = line.rfind("/") + 1;
+                fname = line.substr(nameStart, line.find("' ") - nameStart);
             } else {
-                // Start of filename = `ls -la` time separator + 4
-                size_t nameStart = output.front().find_first_of(":") + 4;
-                const string& fname_l = output.front().substr(nameStart);
-                const string fname_n = fname_l.substr(0, fname_l.find(" -> "));
-                cout << "Adding file:" << fname_n <<":" << endl;
-                filler(buf, fname_n.c_str(), NULL, 0);
-                const string path_string_c = path_string
-                    + (path_string == "/" ? "" : "/") + fname_n;
-
-                cout << "caching " << path_string_c << " = " << output.front() <<  endl;
-                fileData[path_string_c].statOutput = output.front();
-                fileData[path_string_c].timestamp = time(NULL);
-                cout << "cached " << endl;
+                continue;
             }
+        } else {
+            // Start of filename = `ls -la` time separator + 4
+            size_t nameStart = line.find_first_of(":") + 4;
+            const string fname_l = line.substr(nameStart);
+            fname = fname_l.substr(0, fname_l.find(" -> "));
         }
-        output.pop();
-    }
-    cout << "done with found files" << endl;
 
+        // Pass i+1 as the resume offset so the kernel continues from here on
+        // the next call instead of restarting from the top. If the buffer is
+        // full we stop; this entry is retried (and cached) next time.
+        if (filler(buf, fname.c_str(), NULL, i + 1))
+            return 0;
+
+        const string path_string_c = path_string
+            + (path_string == "/" ? "" : "/") + fname;
+        if (valid)
+            fileData[path_string_c].statOutput = line;
+        else
+            fileData[path_string_c].statOutput.erase();
+        fileData[path_string_c].timestamp = time(NULL);
+    }
 
     return 0;
 }
@@ -888,6 +921,7 @@ static int adb_truncate(const char *path, off_t size) {
     fileTruncated[path_string] = true;
 
     invalidateCache(path_string);
+    invalidateParentDirCache(path_string);
 
     cout << "truncate[path=" << local_path_string << "][size=" << size << "]" << endl;
 
@@ -935,6 +969,7 @@ static int adb_mkdir(const char *path, mode_t mode) {
     command.append("'");
     adb_shell(command);
     invalidateCache(path_string);
+    invalidateParentDirCache(path_string);
     return 0;
 }
 
@@ -967,6 +1002,8 @@ static int adb_rename(const char *from, const char *to) {
     }
     invalidateCache(string(from));
     invalidateCache(string(to));
+    invalidateParentDirCache(from_string);
+    invalidateParentDirCache(to_string);
     return 0;
 }
 
@@ -990,6 +1027,8 @@ static int adb_rmdir(const char *path) {
     adb_shell(command);
     if (adbfs_conf.rescan) adb_rescan_dir_removed(path_string);
     invalidateCache(path_string);
+    invalidateDirCache(path_string);
+    invalidateParentDirCache(path_string);
 
     //rmdir(local_path_string.c_str());
     return 0;
@@ -1014,6 +1053,7 @@ static int adb_unlink(const char *path) {
     adb_shell(command);
     if (adbfs_conf.rescan) adb_rescan_file(path_string);
     invalidateCache(path_string);
+    invalidateParentDirCache(path_string);
     unlink(local_path_string.c_str());
     return 0;
 }
