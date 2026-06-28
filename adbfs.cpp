@@ -82,6 +82,7 @@
 #include <sys/types.h>
 #include <pwd.h>
 #include <grp.h>
+#include <pthread.h>
 
 void handler(int sig) {
   void *array[10];
@@ -148,6 +149,32 @@ void invalidateParentDirCache(const string& path) {
 map<int,bool> filePendingWrite;
 map<string,bool> fileTruncated;
 bool touch_gnu_mode = true;
+
+// Read-only opens are served by on-demand ranged reads instead of pulling the
+// whole file up front (see adb_open / adb_read). This avoids downloading entire
+// large files just to read a piece of them (e.g. Finder generating thumbnails,
+// seeking in a video). Once a handle has been read past the threshold below we
+// fall back to a single full pull so sequential/full reads (e.g. `cp`) don't
+// pay per-chunk adb overhead.
+struct ReadHandle {
+    string remote;     // shell-escaped device path
+    string local;      // shell-escaped local temp path (for the pull fallback)
+    string local_raw;  // local temp path, unescaped (for open())
+    off_t served;      // bytes served via ranged reads so far
+    int local_fd;      // >= 0 once we have fallen back to a full pull
+    bool pulling;      // a full pull is currently in progress
+    pthread_mutex_t mtx; // guards the read-ahead buffer below
+    off_t buf_off;     // device offset of buffered bytes, -1 when empty
+    vector<char> buf;  // read-ahead buffer
+};
+map<uint64_t, ReadHandle*> readHandles;
+// FUSE issues read-ahead reads concurrently; this guards the handle table and
+// the pull-fallback decision so the whole file is pulled at most once.
+static pthread_mutex_t readHandleMutex = PTHREAD_MUTEX_INITIALIZER;
+static const off_t RANGED_READ_PULL_THRESHOLD = 4 * 1024 * 1024;
+// One ranged fetch grabs this much, so a run of small sequential reads (e.g.
+// `cp`, media playback) costs one adb round-trip instead of dozens.
+static const size_t RANGED_READ_AHEAD = 1024 * 1024;
 
 /**
    Custom options
@@ -722,6 +749,27 @@ static int adb_create(const char *path, mode_t mode, struct fuse_file_info *fi)
     return 0;
 }
 
+// Fetch [offset, offset+size) of a device file directly into buf using a
+// binary-safe `adb exec-out` + toybox dd ranged read. Returns the number of
+// bytes read (may be short at EOF), or -EIO on failure.
+static int adb_read_range(const string& remote_escaped, off_t offset,
+                          size_t size, char *buf) {
+    ostringstream cmd;
+    cmd << "adb exec-out \"toybox dd if='" << remote_escaped
+        << "' iflag=skip_bytes,count_bytes bs=1048576 skip=" << offset
+        << " count=" << size << " 2>/dev/null\"";
+    FILE *fp = popen(cmd.str().c_str(), "r");
+    if (!fp) return -EIO;
+    size_t total = 0;
+    while (total < size) {
+        size_t n = fread(buf + total, 1, size - total, fp);
+        if (n == 0) break;
+        total += n;
+    }
+    pclose(fp);
+    return (int)total;
+}
+
 static int adb_open(const char *path, struct fuse_file_info *fi)
 {
     string path_string;
@@ -738,6 +786,44 @@ static int adb_open(const char *path, struct fuse_file_info *fi)
     shell_escape_path(local_path_string);
 
     cout << "-- adb_open --" << path_string << " " << local_path_string << "\n";
+
+    // Read-only opens: don't pull the whole file. Confirm it exists, then serve
+    // reads on demand (ranged reads), falling back to a full pull only once the
+    // file is read substantially (see adb_read).
+    if ((fi->flags & O_ACCMODE) == O_RDONLY && !fileTruncated[path_string]) {
+        // getattr runs just before open and caches the file's stat; reuse it so
+        // repeated opens (macOS copyfile opens a file many times) don't each pay
+        // an `ls` round-trip. Only hit the device on a cache miss.
+        map<string, fileCache>::iterator ci = fileData.find(path_string);
+        bool cached_ok = ci != fileData.end() && ci->second.timestamp + 30 >= time(NULL)
+                         && !ci->second.statOutput.empty()
+                         && is_valid_ls_output(ci->second.statOutput);
+        if (!cached_ok) {
+            string command = "ls -l -a -d '";
+            command.append(path_string);
+            command.append("'");
+            queue<string> output = adb_shell(command);
+            if (output.empty()) return -ENOENT;
+            vector<string> output_chunk = make_array(output.front());
+            if (output_chunk.empty() || !is_valid_ls_output(output_chunk[0]))
+                return -ENOENT;
+        }
+        ReadHandle *h = new ReadHandle();
+        h->remote = path_string;
+        h->local = local_path_string;
+        h->local_raw = filehandle_path;
+        h->served = 0;
+        h->local_fd = -1;
+        h->pulling = false;
+        pthread_mutex_init(&h->mtx, NULL);
+        h->buf_off = -1;
+        pthread_mutex_lock(&readHandleMutex);
+        fi->fh = (uint64_t)(uintptr_t)h;
+        readHandles[fi->fh] = h;
+        pthread_mutex_unlock(&readHandleMutex);
+        return 0;
+    }
+
     if (!fileTruncated[path_string]){
         queue<string> output;
         string command = "ls -l -a -d '";
@@ -769,6 +855,55 @@ static int adb_open(const char *path, struct fuse_file_info *fi)
 static int adb_read(const char *path, char *buf, size_t size, off_t offset,
     struct fuse_file_info *fi)
 {
+    pthread_mutex_lock(&readHandleMutex);
+    map<uint64_t, ReadHandle*>::iterator it = readHandles.find(fi->fh);
+    ReadHandle *h = (it != readHandles.end()) ? it->second : NULL;
+    bool do_pull = false;
+    if (h && h->local_fd < 0 && !h->pulling) {
+        // Once a read-only handle has been read substantially, pull the whole
+        // file once and serve the rest locally. Only one thread does this.
+        h->served += size;
+        if (h->served > RANGED_READ_PULL_THRESHOLD)
+            do_pull = h->pulling = true;
+    }
+    pthread_mutex_unlock(&readHandleMutex);
+
+    if (h) {
+        if (do_pull) {
+            adb_pull(h->remote, h->local);
+            int lfd = open(h->local_raw.c_str(), O_RDONLY);
+            pthread_mutex_lock(&readHandleMutex);
+            h->local_fd = lfd;
+            h->pulling = false;
+            pthread_mutex_unlock(&readHandleMutex);
+        }
+        if (h->local_fd >= 0) {
+            int res = pread(h->local_fd, buf, size, offset);
+            return res == -1 ? -errno : res;
+        }
+        // Ranged read served through a per-handle read-ahead buffer.
+        pthread_mutex_lock(&h->mtx);
+        bool covered = h->buf_off >= 0 && offset >= h->buf_off &&
+                       (off_t)(offset + size) <= h->buf_off + (off_t)h->buf.size();
+        if (!covered) {
+            size_t fetch = size > RANGED_READ_AHEAD ? size : RANGED_READ_AHEAD;
+            h->buf.resize(fetch);
+            int got = adb_read_range(h->remote, offset, fetch, &h->buf[0]);
+            if (got < 0) {
+                pthread_mutex_unlock(&h->mtx);
+                return got;
+            }
+            h->buf.resize(got);
+            h->buf_off = offset;
+        }
+        size_t start = offset - h->buf_off;
+        size_t avail = h->buf.size() - start;
+        size_t n = size < avail ? size : avail;
+        if (n) memcpy(buf, &h->buf[start], n);
+        pthread_mutex_unlock(&h->mtx);
+        return (int)n;
+    }
+
     int fd;
     int res;
     fd = fi->fh; //open(local_path_string.c_str(), O_RDWR);
@@ -803,6 +938,12 @@ static int adb_write(const char *path, const char *buf, size_t size, off_t offse
 
 
 static int adb_flush(const char *path, struct fuse_file_info *fi) {
+    // Read-only ranged handles have nothing to flush back to the device.
+    pthread_mutex_lock(&readHandleMutex);
+    bool ranged = readHandles.count(fi->fh) > 0;
+    pthread_mutex_unlock(&readHandleMutex);
+    if (ranged)
+        return 0;
     string path_string;
     string local_path_string;
     path_string.assign(path);
@@ -828,6 +969,24 @@ static int adb_flush(const char *path, struct fuse_file_info *fi) {
 }
 
 static int adb_release(const char *path, struct fuse_file_info *fi) {
+    // Read-only ranged handle: close/clean up the pull-fallback copy (if any)
+    // and free the handle.
+    pthread_mutex_lock(&readHandleMutex);
+    map<uint64_t, ReadHandle*>::iterator it = readHandles.find(fi->fh);
+    ReadHandle *h = (it != readHandles.end()) ? it->second : NULL;
+    if (h)
+        readHandles.erase(it);
+    pthread_mutex_unlock(&readHandleMutex);
+    if (h) {
+        if (h->local_fd >= 0) {
+            close(h->local_fd);
+            unlink(h->local_raw.c_str());
+        }
+        pthread_mutex_destroy(&h->mtx);
+        delete h;
+        return 0;
+    }
+
     // just like in the other functions
     string path_string;
     string local_path_string;
